@@ -21,6 +21,8 @@ if 'series' not in st.session_state:
     st.session_state.series=[]
 if 'active' not in st.session_state:
     st.session_state.active=INITIAL.copy()
+if 'delete_saved_series' not in st.session_state:
+    st.session_state.delete_saved_series=None
 
 def serialize_project():
     return {'schema_version':1,'series':st.session_state.series,'active':st.session_state.active}
@@ -326,6 +328,32 @@ def latex_table(df, title):
 with st.sidebar:
     st.header('Progetto')
     st.write(f'Serie già salvate nella sessione: **{len(st.session_state.series)}**')
+    if st.session_state.series:
+        with st.expander('Gestisci le serie salvate', expanded=True):
+            st.caption('Puoi eliminare una sola serie senza cancellare le altre.')
+            for index, saved in enumerate(st.session_state.series):
+                saved_name = str(saved.get('config', {}).get('name', f'Serie {index + 1}'))
+                if st.button(f'Elimina {index + 1}: {saved_name}',
+                             key=f'remove_saved_series_{index}', use_container_width=True):
+                    st.session_state.delete_saved_series=index
+                    st.rerun()
+            index=st.session_state.delete_saved_series
+            if isinstance(index,int) and 0 <= index < len(st.session_state.series):
+                saved_name=str(st.session_state.series[index].get('config', {}).get('name', f'Serie {index + 1}'))
+                st.warning(f'Confermi di eliminare la serie «{saved_name}»?')
+                confirm, cancel=st.columns(2)
+                with confirm:
+                    if st.button('Conferma', key='confirm_remove_saved_series',
+                                 type='primary', use_container_width=True):
+                        st.session_state.series.pop(index)
+                        st.session_state.delete_saved_series=None
+                        st.rerun()
+                with cancel:
+                    if st.button('Annulla', key='cancel_remove_saved_series',
+                                 use_container_width=True):
+                        st.session_state.delete_saved_series=None
+                        st.rerun()
+            st.caption('Dopo le modifiche, scarica nuovamente il progetto JSON.')
     st.download_button('Scarica progetto JSON',json.dumps(serialize_project(),indent=2,ensure_ascii=False).encode(),
                        file_name=clean_name(st.session_state.active['name'])+'_progetto.json',mime='application/json',use_container_width=True)
     loaded=st.file_uploader('Riapri un progetto JSON',type=['json'],key='project_upload')
@@ -334,7 +362,9 @@ with st.sidebar:
             obj=json.load(loaded)
             if obj.get('schema_version') != 1 or not isinstance(obj.get('series'),list):
                 raise ValueError('Formato del progetto incompatibile')
-            st.session_state.series=obj['series'];st.session_state.active=obj['active'];st.rerun()
+            st.session_state.series=obj['series'];st.session_state.active=obj['active']
+            st.session_state.delete_saved_series=None
+            st.rerun()
         except (ValueError,KeyError,TypeError) as e: st.error(str(e))
     st.info('Il progetto va scaricato per conservarlo: il server gratuito non è un archivio permanente.')
 
@@ -469,10 +499,13 @@ if results:
         st.session_state.series.append({'config':dict(c),'results':results})
         st.success('Serie aggiunta al progetto. Scarica il JSON per conservarla.')
     st.subheader('4. Esporta i risultati')
-    export_all=st.checkbox('Esporta anche tutte le serie già aggiunte al progetto',value=False)
-    export_rows=list(results)
+    export_all=st.checkbox(
+        'Esporta soltanto le serie salvate nel progetto (senza duplicare la serie attiva)',
+        value=False, disabled=not bool(st.session_state.series))
     if export_all:
-        for s in st.session_state.series:export_rows+=s['results']
+        export_rows=[row for saved in st.session_state.series for row in saved['results']]
+    else:
+        export_rows=list(results)
     exported=pd.DataFrame(export_rows)
     # I campi specifici di altri strumenti restano vuoti, senza impostazioni spurie.
     name=clean_name(c['name'])
