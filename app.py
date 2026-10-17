@@ -1,5 +1,7 @@
 """Applicazione Streamlit: avvio con streamlit run app.py"""
 import io
+import zipfile
+from xml.etree import ElementTree as ET
 import json
 import re
 from decimal import Decimal
@@ -131,9 +133,133 @@ def csv_bytes(df):
     return df.to_csv(index=False,float_format='%.16g').encode('utf-8-sig')
 
 def xlsx_bytes(df):
-    buf=io.BytesIO()
-    with pd.ExcelWriter(buf,engine='openpyxl') as writer:
-        df.to_excel(writer,sheet_name='Risultati',index=False)
+    """Esporta un XLSX con dati raw NUMERICI e rappresentazioni display TESTUALI.
+
+    Non richiede librerie aggiuntive: i file XLSX sono archivi Open XML.
+    Il CSV resta il formato consigliato per preservare integralmente la precisione
+    decimale nei programmi Python (Excel usa circa 15 cifre significative numeriche).
+    """
+    NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    ET.register_namespace('', NS)
+    ET.register_namespace('r', REL)
+    q = lambda name: '{' + NS + '}' + name
+
+    # I dati *display*, gli identificatori e le formule rimangono testo.
+    # Le colonne raw (e i parametri numerici) diventano veri numeri Excel.
+    numeric_columns = {
+        'value_raw', 'uncertainty_raw', 'range_used', 'riga',
+        'frequency_hz', 'frequency_uncertainty_hz', 'time_scale_s_div',
+        'time_delay_s', 'time_uncertainty_s', 'frequenza_Hz',
+        'incertezza_f_Hz', 'V_div', 'offset_V', 's_div',
+    }
+    columns = [str(c) for c in df.columns]
+
+    def column_letter(i):
+        i += 1
+        result = ''
+        while i:
+            i, remainder = divmod(i - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
+    def put_cell(row, reference, value, *, heading=False, numeric=False, text_format=False):
+        if value is None or str(value).strip().lower() in ('', 'nan', 'none', 'nat', '<na>'):
+            return
+        text = str(value).strip()
+        if numeric:
+            try:
+                number = Decimal(text)
+                if number.is_finite():
+                    cell = ET.SubElement(row, q('c'), r=reference, s='2')
+                    ET.SubElement(cell, q('v')).text = format(number, 'f')
+                    return
+            except Exception:
+                pass
+        cell = ET.SubElement(row, q('c'), r=reference, t='inlineStr', s='1' if heading else '3' if text_format else '0')
+        item = ET.SubElement(ET.SubElement(cell, q('is')), q('t'))
+        item.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        item.text = text
+
+    root = ET.Element(q('worksheet'))
+    last_col = column_letter(len(columns) - 1) if columns else 'A'
+    end_row = max(len(df) + 1, 1)
+    ET.SubElement(root, q('dimension'), ref=f'A1:{last_col}{end_row}')
+    sheet_views = ET.SubElement(root, q('sheetViews'))
+    view = ET.SubElement(sheet_views, q('sheetView'), workbookViewId='0')
+    ET.SubElement(view, q('pane'), ySplit='1', topLeftCell='A2', activePane='bottomLeft', state='frozen')
+    ET.SubElement(view, q('selection'), pane='bottomLeft', activeCell='A2', sqref='A2')
+    ET.SubElement(root, q('sheetFormatPr'), defaultRowHeight='18')
+    widths = ET.SubElement(root, q('cols'))
+    for i, name in enumerate(columns, start=1):
+        width = 42 if name == 'formula' else 40 if name == 'notes' else min(28, max(14, len(name) + 3))
+        ET.SubElement(widths, q('col'), min=str(i), max=str(i), width=str(width), customWidth='1')
+    data = ET.SubElement(root, q('sheetData'))
+    header = ET.SubElement(data, q('row'), r='1', ht='24', customHeight='1')
+    for i, name in enumerate(columns):
+        put_cell(header, f'{column_letter(i)}1', name, heading=True)
+    for row_index, record in enumerate(df.itertuples(index=False, name=None), start=2):
+        row = ET.SubElement(data, q('row'), r=str(row_index))
+        for col_index, (name, value) in enumerate(zip(columns, record)):
+            put_cell(row, f'{column_letter(col_index)}{row_index}', value,
+                     numeric=name in numeric_columns,
+                     text_format=name in {'value_display', 'uncertainty_display', 'input_value'})
+    ET.SubElement(root, q('autoFilter'), ref=f'A1:{last_col}{end_row}')
+    ET.SubElement(root, q('pageMargins'), left='0.5', right='0.5', top='0.7', bottom='0.7', header='0.3', footer='0.3')
+
+    # Formattazione indipendente da pandas/openpyxl: intestazione, celle numeriche,
+    # colonne leggibili e filtri in Excel.
+    styles = '''<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="164" formatCode="0.################"/></numFmts>
+  <fonts count="2">
+    <font><sz val="11"/><name val="Aptos"/></font>
+    <font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Aptos"/></font>
+  </fonts>
+  <fills count="3">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FF243B53"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="4">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+    <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+    <xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    workbook = (f'<?xml version="1.0" encoding="UTF-8"?>'
+                f'<workbook xmlns="{NS}" xmlns:r="{REL}">'
+                f'<sheets><sheet name="Risultati" sheetId="1" r:id="rId1"/></sheets>'
+                f'</workbook>')
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    package_rels = '''<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    content_types = '''<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as book:
+        book.writestr('[Content_Types].xml', content_types)
+        book.writestr('_rels/.rels', package_rels)
+        book.writestr('xl/workbook.xml', workbook)
+        book.writestr('xl/_rels/workbook.xml.rels', workbook_rels)
+        book.writestr('xl/styles.xml', styles)
+        book.writestr('xl/worksheets/sheet1.xml', ET.tostring(root, encoding='utf-8', xml_declaration=True))
     return buf.getvalue()
 
 def latex_escape(s):
