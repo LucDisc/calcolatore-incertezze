@@ -3,7 +3,7 @@
 I risultati sono limiti di accuratezza del costruttore, non deviazioni standard.
 Coefficienti trascritti dalle tabelle fornite per questa esperienza.
 """
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation, localcontext, ROUND_HALF_UP
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -74,7 +74,7 @@ def sig(x, n=4):
     places = x.adjusted()-int(n)+1
     with localcontext() as ctx:
         ctx.prec = 50
-        rounded=x.quantize(D('1').scaleb(places))
+        rounded=x.quantize(D('1').scaleb(places), rounding=ROUND_HALF_UP)
     return format(rounded,'f')
 
 def normal(value):
