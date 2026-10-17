@@ -70,6 +70,23 @@ def dataframe_from_paste(raw, keys=None):
         rows.append(row)
     return pd.DataFrame(rows,columns=keys).fillna('')
 
+def range_with_unit(instrument, kind, raw_range):
+    """Testo per esseri umani; il campo range_used rimane numerico nei CSV."""
+    if raw_range is None or not str(raw_range).strip():
+        return ''
+    if instrument != '34460A':
+        return str(raw_range)
+    value = Decimal(str(raw_range))
+    if kind == 'Resistenza':
+        if value >= Decimal('1000000'):
+            return f"{format((value / Decimal('1000000')).normalize(), 'f')} MΩ"
+        if value >= Decimal('1000'):
+            return f"{format((value / Decimal('1000')).normalize(), 'f')} kΩ"
+        return f"{format(value.normalize(), 'f')} Ω"
+    if value < 1:
+        return f"{format((value * 1000).normalize(), 'f')} mV"
+    return f"{format(value.normalize(), 'f')} V"
+
 def calculate_series(config, rows):
     good=[]; errors=[]
     for i,row in enumerate(rows):
@@ -90,12 +107,21 @@ def calculate_series(config, rows):
                     frequency_source=config.get('frequency_source','AFG-2225'),
                     frequency_years=config.get('frequency_years',0))
             d=r.__dict__.copy(); d['serie']=config['name']; d['riga']=i+1
-            d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
-            d['V_div']=opt('V_div',config['v_div']); d['offset_V']=opt('offset_V',config['offset'])
-            if config['instrument']=='EDUX1052G' and config['kind'].startswith('Fase'):
-                d['s_div']=opt('s_div',config.get('s_div',''))
+            # Conserviamo il range numerico per Python e una rappresentazione con unità
+            # per il controllo visivo e l'esportazione LaTeX.
+            d['range_display']=range_with_unit(r.instrument,r.kind,r.range_used)
+            # Compiliamo i metadati solo quando pertinenti alla misura selezionata.
+            # Le altre celle CSV rimangono vuote (non contengono valori di default fittizi).
+            if (config['instrument']=='34460A' and config['kind']=='Tensione AC') or (config['instrument']=='AFG-2225' and config['kind']=='Ampiezza Vpp'):
                 d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
-                d['incertezza_f_Hz']=d['frequency_uncertainty_hz']
+            if config['instrument']=='EDUX1052G':
+                if config['kind']=='Tensione (DC verticale)':
+                    d['V_div']=opt('V_div',config['v_div'])
+                    d['offset_V']=opt('offset_V',config['offset'])
+                elif config['kind'].startswith('Fase'):
+                    d['s_div']=opt('s_div',config.get('s_div',''))
+                    d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
+                    d['incertezza_f_Hz']=d['frequency_uncertainty_hz']
             good.append(d)
         except (MeasurementError,ValueError) as e:
             errors.append(f"Riga {i+1}, valore {val}: {e}")
@@ -111,14 +137,60 @@ def xlsx_bytes(df):
     return buf.getvalue()
 
 def latex_escape(s):
-    return str(s).replace('\\','\\textbackslash{}').replace('&','\\&').replace('%','\\%').replace('_','\\_').replace('#','\\#')
+    """Protezione dei nomi della serie nelle celle e nelle caption."""
+    return (str(s).replace('\\', r'\textbackslash{}').replace('&', r'\&')
+            .replace('%', r'\%').replace('_', r'\_').replace('#', r'\#')
+            .replace('{', r'\{').replace('}', r'\}'))
+
+LATEX_UNIT = {
+    'V': r'\,\mathrm{V}', 'mV': r'\,\mathrm{mV}', 'uV': r'\,\mu\mathrm{V}',
+    'A': r'\,\mathrm{A}', 'mA': r'\,\mathrm{mA}', 'uA': r'\,\mu\mathrm{A}',
+    'ohm': r'\,\Omega', 'kohm': r'\,\mathrm{k}\Omega', 'Mohm': r'\,\mathrm{M}\Omega',
+    'Ω': r'\,\Omega', 'kΩ': r'\,\mathrm{k}\Omega', 'MΩ': r'\,\mathrm{M}\Omega',
+    'F': r'\,\mathrm{F}', 'mF': r'\,\mathrm{mF}', 'uF': r'\,\mu\mathrm{F}',
+    'nF': r'\,\mathrm{nF}', 'pF': r'\,\mathrm{pF}',
+    'Hz': r'\,\mathrm{Hz}', 'kHz': r'\,\mathrm{kHz}', 'MHz': r'\,\mathrm{MHz}',
+    's': r'\,\mathrm{s}', 'ms': r'\,\mathrm{ms}',
+    'us': r'\,\mu\mathrm{s}', 'ns': r'\,\mathrm{ns}',
+    'Vpp': r'\,\mathrm{V}_{\mathrm{pp}}', 'mVpp': r'\,\mathrm{mV}_{\mathrm{pp}}',
+    'deg': r'^{\circ}',
+    'V/div': r'\,\mathrm{V/div}', 's/div': r'\,\mathrm{s/div}',
+}
+
+def latex_number(s):
+    """Converte la notazione scientifica nell'equivalente LaTeX con punti decimali."""
+    t=str(s).strip().replace(',','.')
+    if not re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?',t):
+        raise ValueError(f'Numero esportabile non valido: {s!r}')
+    if 'e' in t.lower():
+        mantissa,exponent=re.split('[eE]',t)
+        return f'{mantissa}\\times 10^{{{int(exponent)}}}'
+    return t
+
+def latex_range(record):
+    # In LaTeX le unità sono prodotte con comandi matematici: niente simboli
+    # Unicode che potrebbero non essere supportati da pdfLaTeX.
+    display=str(record.get('range_display','') or '').strip()
+    if not display:
+        display=range_with_unit(record.get('instrument',''),record.get('kind',''),record.get('range_used',''))
+    if not display:
+        return '--'
+    match=re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s+(mV|V|Ω|kΩ|MΩ|V/div|s/div)',display)
+    if match:
+        return '$'+latex_number(match.group(1))+LATEX_UNIT[match.group(2)]+'$'
+    return latex_escape(display)
 
 def latex_table(df, title):
     parts=[r'\begin{table}[htbp]',r'\centering',r'\small',
-           r'\caption{'+latex_escape(title)+'}',r'\begin{tabular}{lllll}',r'\toprule',
-           r'Serie & Valore & Incertezza & Unit\`a & Portata / V/div \\',r'\midrule']
+           r'\caption{'+latex_escape(title)+'}',r'\begin{tabular}{lll}',r'\toprule',
+           r'Serie & Misura ($x \pm \Delta x$) & Portata / scala \\',r'\midrule']
     for _,r in df.iterrows():
-        parts.append(' & '.join(latex_escape(r.get(k,'')) for k in ['serie','value_display','uncertainty_display','unit','range_used'])+r' \\')
+        unit=str(r['unit'])
+        if unit not in LATEX_UNIT:
+            raise ValueError(f'Unità non disponibile per LaTeX: {unit}')
+        measure=(r'$('+latex_number(r['value_display'])+r' \pm '
+                 +latex_number(r['uncertainty_display'])+r')'+LATEX_UNIT[unit]+'$')
+        parts.append(latex_escape(r.get('serie',''))+' & '+measure+' & '+latex_range(r)+r' \\')
     parts += [r'\bottomrule',r'\end{tabular}',r'\end{table}']
     return '\n'.join(parts)+'\n'
 
@@ -251,7 +323,7 @@ if errors:
     for e in errors: st.write('• '+e)
 if results:
     view=pd.DataFrame(results)
-    display_cols=['riga','value_display','uncertainty_display','unit','range_used']
+    display_cols=['riga','value_display','uncertainty_display','unit','range_display']
     if selected=='EDUX1052G' and c['kind'].startswith('Fase'):
         display_cols += ['frequency_hz','frequency_uncertainty_hz',
                          'time_delay_s','time_uncertainty_s']
@@ -267,6 +339,7 @@ if results:
     if export_all:
         for s in st.session_state.series:export_rows+=s['results']
     exported=pd.DataFrame(export_rows)
+    # I campi specifici di altri strumenti restano vuoti, senza impostazioni spurie.
     name=clean_name(c['name'])
     # CSV: numeri esatti riportati con punto; read_csv leggerà le colonne raw come numeri.
     a,b,d=st.columns(3)
