@@ -34,6 +34,8 @@ def row_columns(config):
             return ['valore','s_div','frequenza_Hz','incertezza_f_Hz','unita']
         if config['kind']=='Tensione (DC verticale)':
             return ['valore','V_div','offset_V','unita']
+        if config['kind']=='Tensione picco-picco (Vpp)':
+            return ['valore','V_div','unita']
         return ['valore','unita']
     if config['instrument']=='34460A':
         return ['valore','portata','frequenza_Hz','unita']
@@ -117,9 +119,10 @@ def calculate_series(config, rows):
             if (config['instrument']=='34460A' and config['kind']=='Tensione AC') or (config['instrument']=='AFG-2225' and config['kind']=='Ampiezza Vpp'):
                 d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
             if config['instrument']=='EDUX1052G':
-                if config['kind']=='Tensione (DC verticale)':
+                if config['kind'] in ('Tensione (DC verticale)', 'Tensione picco-picco (Vpp)'):
                     d['V_div']=opt('V_div',config['v_div'])
-                    d['offset_V']=opt('offset_V',config['offset'])
+                    if config['kind']=='Tensione (DC verticale)':
+                        d['offset_V']=opt('offset_V',config['offset'])
                 elif config['kind'].startswith('Fase'):
                     d['s_div']=opt('s_div',config.get('s_div',''))
                     d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
@@ -357,11 +360,17 @@ with col2:
 with col3:
     if (selected=='34460A' and c['kind']=='Tensione AC') or (selected=='AFG-2225' and c['kind']=='Ampiezza Vpp') or (selected=='EDUX1052G' and c['kind'].startswith('Fase')):
         c['frequency']=st.text_input('Frequenza predefinita (Hz)',value=str(c['frequency']))
-    if selected=='EDUX1052G' and c['kind']=='Tensione (DC verticale)':
-        c['v_div']=st.selectbox('V/div predefinito',OSC_DIVS,index=OSC_DIVS.index(str(c['v_div'])) if str(c['v_div']) in OSC_DIVS else 7)
-        c['offset']=st.text_input('Offset predefinito (V)',value=str(c['offset']))
-        c['full_scale_divisions']=st.number_input('Divisioni verticali di fondo scala (ipotesi verificabile)',min_value=1,max_value=20,value=int(c['full_scale_divisions']))
-        st.warning('Verificare dal manuale il fondo scala effettivo. La formula verticale riguarda l’accuratezza DC, non tutte le misure AC.')
+    if selected=='EDUX1052G' and c['kind'] in ('Tensione (DC verticale)', 'Tensione picco-picco (Vpp)'):
+        c['v_div']=st.selectbox('V/div predefinito',OSC_DIVS,index=OSC_DIVS.index(str(c['v_div'])) if str(c['v_div']) in OSC_DIVS else 7,
+                                format_func=lambda x: f'{x} V/div')
+        if c['kind']=='Tensione (DC verticale)':
+            c['offset']=st.text_input('Offset predefinito (V)',value=str(c['offset']))
+            c['full_scale_divisions']=st.number_input('Divisioni verticali di fondo scala (ipotesi verificabile)',min_value=1,max_value=20,value=int(c['full_scale_divisions']))
+            st.warning('Verificare dal manuale il fondo scala effettivo. La formula verticale riguarda l’accuratezza DC, non tutte le misure AC.')
+        else:
+            st.info('Vpp: stima concordata dal SOLO guadagno verticale: 3% di (8 × V/div) '
+                    'se scala >= 10 mV/div, altrimenti 4%. Non è una specifica di accuratezza '
+                    'della misura automatica Vpp. Offset, rumore e sonde non compresi.')
     if selected=='EDUX1052G' or selected=='AFG-2225':
         c['years']=st.number_input('Anni per contributo aging (0 = escluso)',min_value=0,max_value=50,value=int(c['years']))
     if selected=='AFG-2225' and c['kind']=='Ampiezza Vpp':
@@ -479,7 +488,10 @@ else:
 with st.expander('Informazioni sulle formule e sulle limitazioni'):
     st.write('Le specifiche derivano dalle tabelle dei manuali fornite per questa esperienza. Il programma non certifica condizioni operative non documentate.')
     st.write('AFG-2225: l’ampiezza a 1 kHz e la flatness fuori da 1 kHz sono combinate con una somma conservativa facoltativa; serve verificare carico e altre condizioni del manuale.')
-    st.write('EDUX1052G: il fondo scala verticale è configurabile; l’accuratezza della base tempi non copre tutti i contributi alla misura temporale.')
+    st.write('EDUX1052G: per la tensione DC il fondo scala verticale è configurabile; l’accuratezza della base tempi non copre tutti i contributi alla misura temporale.')
+    st.write('EDUX1052G Vpp: stima ΔVpp = (0.03 se V/div >= 0.010, altrimenti 0.04) × 8 × V/div. '
+             'Usa soltanto DC vertical gain accuracy una volta; NON è una specifica ufficiale di accuracy Vpp. '
+             'Gli errori da rumore, sonde e algoritmo di misura dei picchi non sono inclusi.')
     st.write('Fase: Δt = fase/(360 f) se la fase è letta; fase = 360 f Δt se si misura il ritardo. '
              'Δt_err = (50 + 5×anni) ppm × |Δt| + 0.0016 × 10 × s/div + 200 ps. '
              'Δfase = 360 sqrt((Δt Δf)^2 + (f Δt_err)^2). '

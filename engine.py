@@ -40,7 +40,7 @@ UNIT_SCALE = {
 }
 KINDS = {
     '34460A': {'Tensione DC':'V', 'Tensione AC':'V', 'Resistenza':'ohm'},
-    'EDUX1052G': {'Tensione (DC verticale)':'V', 'Intervallo temporale':'s',
+    'EDUX1052G': {'Tensione (DC verticale)':'V', 'Tensione picco-picco (Vpp)':'Vpp', 'Intervallo temporale':'s',
                    'Fase letta (gradi)':'deg', 'Fase da ritardo':'s'},
     'GPE-4323': {'Tensione impostata':'V', 'Tensione letta':'V', 'Corrente impostata':'A', 'Corrente letta':'A'},
     'AFG-2225': {'Frequenza generata':'Hz', 'Ampiezza Vpp':'Vpp'},
@@ -152,7 +152,27 @@ def calculate(instrument, kind, value, unit, *, range_used='auto', frequency=Non
             dx=D('0.0005')*absx; formula='0.05% × |lettura|'
             note='Solo basic accuracy: verificare condizioni di applicabilità nel manuale.'
         elif instrument=='EDUX1052G':
-            if kind=='Tensione (DC verticale)':
+            if kind=='Tensione picco-picco (Vpp)':
+                # Stima convenzionale concordata per la misura automatica Vpp.
+                # Usa SOLO il contributo 'DC vertical gain accuracy' del manuale.
+                # NON e' l'accuratezza Vpp certificata da Keysight.
+                # Il fondo scala della schermata e' pari a 8 divisioni verticali.
+                if v_div is None or str(v_div).strip()=='':
+                    raise MeasurementError('Per la tensione Vpp inserire la scala V/div')
+                sv=dec(v_div)
+                if sv<=0:
+                    raise MeasurementError('V/div deve essere positivo')
+                fs=D('8')*sv
+                pct=D('0.03') if sv>=D('0.01') else D('0.04')
+                dx=pct*fs
+                r=f'{normal(sv)} V/div'
+                formula=('3% × (8 × V/div) [guadagno verticale]' if sv>=D('0.01')
+                         else '4% × (8 × V/div) [guadagno verticale]')
+                note=('STIMA Vpp, non accuratezza Vpp certificata: applicato una volta '
+                      'il solo termine DC vertical gain accuracy (3% o 4% del fondo scala); '
+                      'FS=8×V/div; offset comune escluso; rumore, sonde ed errore '
+                      'dell’algoritmo di ricerca dei picchi non inclusi.')
+            elif kind=='Tensione (DC verticale)':
                 if v_div is None or str(v_div).strip()=='':
                     raise MeasurementError('Inserire la scala verticale V/div')
                 sv=dec(v_div); off=dec(offset)
