@@ -23,9 +23,14 @@ if 'active' not in st.session_state:
     st.session_state.active=INITIAL.copy()
 if 'delete_saved_series' not in st.session_state:
     st.session_state.delete_saved_series=None
+if '_pending_project_name' in st.session_state:
+    st.session_state.project_name=st.session_state.pop('_pending_project_name')
+if 'project_name' not in st.session_state:
+    st.session_state.project_name='Misure_esperienza'
 
 def serialize_project():
-    return {'schema_version':1,'series':st.session_state.series,'active':st.session_state.active}
+    return {'schema_version':1,'series':st.session_state.series,'active':st.session_state.active,
+            'project_name':st.session_state.project_name}
 
 def clean_name(value):
     return re.sub(r'[^A-Za-z0-9_-]+','_',str(value).strip()).strip('_') or 'misure'
@@ -207,7 +212,9 @@ def xlsx_bytes(df):
         row = ET.SubElement(data, q('row'), r=str(row_index))
         for col_index, (name, value) in enumerate(zip(columns, record)):
             put_cell(row, f'{column_letter(col_index)}{row_index}', value,
-                     numeric=name in numeric_columns,
+                     numeric=(name in numeric_columns or name.endswith('__value_raw')
+                              or name.endswith('__uncertainty_raw')
+                              or name.endswith('__frequency_hz')),
                      text_format=name in {'value_display', 'uncertainty_display', 'input_value'})
     ET.SubElement(root, q('autoFilter'), ref=f'A1:{last_col}{end_row}')
     ET.SubElement(root, q('pageMargins'), left='0.5', right='0.5', top='0.7', bottom='0.7', header='0.3', footer='0.3')
@@ -325,8 +332,201 @@ def latex_table(df, title):
     parts += [r'\bottomrule',r'\end{tabular}',r'\end{table}']
     return '\n'.join(parts)+'\n'
 
+
+
+def xlsx_multiple_sheets(sheets):
+    """Usa il generatore XLSX già collaudato anche per più fogli.
+
+    Per mantenere il progetto compatibile con Streamlit gratuito non serve
+    alcuna nuova dipendenza. I numeri raw rimangono celle numeric Excel.
+    """
+    if not sheets:
+        raise ValueError('Nessun foglio da esportare')
+    NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    names = list(sheets)
+    sheet_xml = []
+    for frame in sheets.values():
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes(frame))) as single:
+            sheet_xml.append(single.read('xl/worksheets/sheet1.xml'))
+            styles = single.read('xl/styles.xml')
+
+    sheet_tags = ''.join(
+        f'<sheet name="{xml_attribute(name)}" sheetId="{i}" r:id="rId{i}"/>'
+        for i,name in enumerate(names, start=1)
+    )
+    workbook = (f'<?xml version="1.0" encoding="UTF-8"?>'
+                f'<workbook xmlns="{NS}" xmlns:r="{REL}">'
+                f'<sheets>{sheet_tags}</sheets></workbook>')
+    relationships = ''.join(
+        f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+        for i in range(1, len(names)+1)
+    )
+    workbook_rels = (f'<?xml version="1.0" encoding="UTF-8"?>'
+                     f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                     f'{relationships}'
+                     f'<Relationship Id="rId{len(names)+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                     f'</Relationships>')
+    content_sheets = ''.join(
+        f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for i in range(1, len(names)+1)
+    )
+    types = (f'<?xml version="1.0" encoding="UTF-8"?>'
+             f'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             f'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             f'<Default Extension="xml" ContentType="application/xml"/>'
+             f'<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+             f'<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+             f'{content_sheets}</Types>')
+    package_rels = ('<?xml version="1.0" encoding="UTF-8"?>'
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                    '</Relationships>')
+    out=io.BytesIO()
+    with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', types)
+        z.writestr('_rels/.rels', package_rels)
+        z.writestr('xl/workbook.xml', workbook)
+        z.writestr('xl/_rels/workbook.xml.rels', workbook_rels)
+        z.writestr('xl/styles.xml', styles)
+        for i,xml in enumerate(sheet_xml, start=1):
+            z.writestr(f'xl/worksheets/sheet{i}.xml', xml)
+    return out.getvalue()
+
+
+def xml_attribute(value):
+    import html
+    return html.escape(str(value), quote=True)
+
+
+def unique_name(value, used, limit=None):
+    """Nomi distinti anche quando due serie hanno lo stesso titolo."""
+    initial = clean_name(value)
+    if limit is not None:
+        initial = initial[:limit]
+    candidate = initial
+    index = 2
+    while candidate.lower() in used:
+        suffix = f'_{index}'
+        candidate = initial[:limit-len(suffix)] + suffix if limit else initial+suffix
+        index += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def summary_by_row(series_dfs, labels):
+    """Affianca i dati per numero di riga, MA NON pretende di allinearli
+    automaticamente per frequenza: l'ordine delle tre serie va verificato.
+    """
+    widest = max((len(df) for df in series_dfs), default=0)
+    rows=[]
+    for i in range(widest):
+        row = {'riga': i+1, 'frequenza_Hz': ''}
+        for name,df in zip(labels,series_dfs):
+            if i >= len(df):
+                for field in ('value_raw','uncertainty_raw','value_display','uncertainty_display','unit','range_display'):
+                    row[f'{name}__{field}']=''
+                continue
+            src=df.iloc[i]
+            for field in ('value_raw','uncertainty_raw','value_display','uncertainty_display','unit','range_display'):
+                item=src.get(field, '')
+                row[f'{name}__{field}']='' if pd.isna(item) else item
+            f=src.get('frequency_hz','')
+            if pd.notna(f) and str(f).strip() and not str(row['frequenza_Hz']).strip():
+                row['frequenza_Hz']=str(f)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def series_from_saved(saved):
+    """Usa SOLO serie già aggiunte: la serie attiva non viene duplicata."""
+    result=[]
+    for item in saved:
+        data=item.get('results',[])
+        if not data:
+            continue
+        label=str(item.get('config',{}).get('name','Serie'))
+        result.append((label,pd.DataFrame(data)))
+    return result
+
+
+def zip_from_files(files):
+    data=io.BytesIO()
+    with zipfile.ZipFile(data,'w',zipfile.ZIP_DEFLATED) as z:
+        for name,content in files.items():
+            z.writestr(name,content)
+    return data.getvalue()
+
+
+def generate_project_exports(saved, project_name, project_json):
+    """Tre opzioni di download: separate, complessive e tutto insieme."""
+    series=series_from_saved(saved)
+    if not series:
+        raise ValueError('Aggiungi almeno una serie al progetto')
+    prefix=clean_name(project_name)
+    used_names=set()
+    file_labels=[]
+    tables=[]
+    for label,df in series:
+        file_labels.append(unique_name(label,used_names))
+        tables.append(df)
+    all_df=pd.concat(tables,ignore_index=True,sort=False)
+    # Il riepilogo per riga è utile quando tutte le serie hanno lo stesso ordine.
+    # Non effettuiamo accoppiamenti automatici per frequenza in assenza di ID univoci.
+    pivot_labels=[]
+    taken=set()
+    for label in file_labels:
+        token=label.split('_')[-1]
+        pivot_labels.append(unique_name(token,taken))
+    wide=summary_by_row(tables,pivot_labels)
+
+    separate={}
+    for label,df in zip(file_labels,tables):
+        base=f'Serie_separate/{label}'
+        separate[base+'.csv']=csv_bytes(df)
+        separate[base+'.xlsx']=xlsx_bytes(df)
+        separate[base+'.tex']=latex_table(df,label).encode('utf-8')
+
+    sheet_names={'Riepilogo','Tutte_le_misure'}
+    sheets={'Riepilogo':wide}
+    for label,df in zip(pivot_labels,tables):
+        name=unique_name(label,sheet_names,31)
+        sheets[name]=df
+    sheets['Tutte_le_misure']=all_df
+    complete={
+        f'Risultati_completi/{prefix}_completo.csv':csv_bytes(all_df),
+        f'Risultati_completi/{prefix}_riepilogo_per_riga.csv':csv_bytes(wide),
+        f'Risultati_completi/{prefix}_completo.xlsx':xlsx_multiple_sheets(sheets),
+        f'Risultati_completi/{prefix}_completo.tex':('\n\n'.join(latex_table(df,label) for label,df in zip(file_labels,tables))).encode('utf-8')
+    }
+    full=dict(separate)
+    full.update(complete)
+    full[f'{prefix}_progetto.json']=project_json
+    readme=(f'Progetto: {project_name}\n'
+            f'Serie salvate: {len(series)}\n'
+            f'Numero totale di misure: {len(all_df)}\n\n'
+            'Serie_separate/: CSV, XLSX e LaTeX per ogni serie.\n'
+            'Risultati_completi/: CSV lungo, riepilogo CSV per riga, Excel a piu fogli e LaTeX con tutte le tabelle.\n'
+            'Il riepilogo associa Vin, Vout e Fase per POSIZIONE NELLA SERIE (riga 1 con riga 1, ecc.).\n'
+            'Controllare che le serie siano nello stesso ordine e riferite alle stesse frequenze.\n'
+            'value_raw e uncertainty_raw sono numeri per i calcoli; *_display preservano gli zeri finali.\n'
+            'Il LaTeX usa sempre il punto decimale.\n').encode('utf-8')
+    full['ISTRUZIONI.txt']=readme
+    complete['ISTRUZIONI.txt']=readme
+    return {
+        'separate':zip_from_files(separate),
+        'combined':zip_from_files(complete),
+        'all':zip_from_files(full),
+        'n_series':len(series),
+        'n_measurements':len(all_df),
+        'lengths':[len(df) for df in tables],
+        'pivot':wide,
+    }
+
 with st.sidebar:
     st.header('Progetto')
+    st.text_input('Nome generale del progetto (per i download complessivi)',
+                  key='project_name')
     st.write(f'Serie già salvate nella sessione: **{len(st.session_state.series)}**')
     if st.session_state.series:
         with st.expander('Gestisci le serie salvate', expanded=True):
@@ -355,7 +555,7 @@ with st.sidebar:
                         st.rerun()
             st.caption('Dopo le modifiche, scarica nuovamente il progetto JSON.')
     st.download_button('Scarica progetto JSON',json.dumps(serialize_project(),indent=2,ensure_ascii=False).encode(),
-                       file_name=clean_name(st.session_state.active['name'])+'_progetto.json',mime='application/json',use_container_width=True)
+                       file_name=clean_name(st.session_state.project_name)+'_progetto.json',mime='application/json',use_container_width=True)
     loaded=st.file_uploader('Riapri un progetto JSON',type=['json'],key='project_upload')
     if loaded is not None and st.button('Carica questo progetto'):
         try:
@@ -363,6 +563,8 @@ with st.sidebar:
             if obj.get('schema_version') != 1 or not isinstance(obj.get('series'),list):
                 raise ValueError('Formato del progetto incompatibile')
             st.session_state.series=obj['series'];st.session_state.active=obj['active']
+            st.session_state._pending_project_name=obj.get(
+                'project_name',st.session_state.active.get('name','Misure_esperienza'))
             st.session_state.delete_saved_series=None
             st.rerun()
         except (ValueError,KeyError,TypeError) as e: st.error(str(e))
@@ -498,25 +700,46 @@ if results:
     if st.button('Aggiungi questa serie al progetto'):
         st.session_state.series.append({'config':dict(c),'results':results})
         st.success('Serie aggiunta al progetto. Scarica il JSON per conservarla.')
-    st.subheader('4. Esporta i risultati')
-    export_all=st.checkbox(
-        'Esporta soltanto le serie salvate nel progetto (senza duplicare la serie attiva)',
-        value=False, disabled=not bool(st.session_state.series))
-    if export_all:
-        export_rows=[row for saved in st.session_state.series for row in saved['results']]
-    else:
-        export_rows=list(results)
-    exported=pd.DataFrame(export_rows)
-    # I campi specifici di altri strumenti restano vuoti, senza impostazioni spurie.
-    name=clean_name(c['name'])
-    # CSV: numeri esatti riportati con punto; read_csv leggerà le colonne raw come numeri.
-    a,b,d=st.columns(3)
-    with a:st.download_button('Scarica CSV',csv_bytes(exported),file_name=name+'.csv',mime='text/csv',use_container_width=True)
-    with b:st.download_button('Scarica Excel',xlsx_bytes(exported),file_name=name+'.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
-    with d:st.download_button('Scarica LaTeX',latex_table(exported,name).encode(),file_name=name+'.tex',mime='text/plain',use_container_width=True)
-    st.download_button('Scarica JSON numerico',exported.to_json(orient='records',force_ascii=False,indent=2).encode(),file_name=name+'_risultati.json',mime='application/json')
+    with st.expander('Esporta solo la serie attualmente visualizzata'):
+        current=pd.DataFrame(results)
+        current_name=clean_name(c['name'])
+        ax,bx,cx=st.columns(3)
+        with ax:
+            st.download_button('CSV attuale', csv_bytes(current),file_name=current_name+'.csv',mime='text/csv',use_container_width=True)
+        with bx:
+            st.download_button('Excel attuale',xlsx_bytes(current),file_name=current_name+'.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',use_container_width=True)
+        with cx:
+            st.download_button('LaTeX attuale',latex_table(current,current_name).encode('utf-8'),file_name=current_name+'.tex',mime='text/plain',use_container_width=True)
 else:
     st.info('Inserisci almeno un valore per visualizzare i risultati.')
+
+st.subheader('4. Esporta il progetto')
+if st.session_state.series:
+    st.caption('I download del progetto usano SOLO le serie salvate nella barra laterale, mai la serie attiva non salvata.')
+    try:
+        project_payload=json.dumps(serialize_project(),indent=2,ensure_ascii=False).encode('utf-8')
+        exports=generate_project_exports(st.session_state.series,st.session_state.project_name,project_payload)
+        st.write(f"**{exports['n_series']} serie salvate, {exports['n_measurements']} misure totali.**")
+        if len(set(exports['lengths']))>1:
+            st.warning('Le serie hanno numeri di righe diversi: il foglio Riepilogo le affianca per posizione, non per frequenza. Controlla gli abbinamenti.')
+        else:
+            st.info('Nel foglio Riepilogo le misure sono affiancate PER ORDINE DI RIGA. Controlla che le serie siano ordinate secondo le stesse frequenze.')
+        prefix=clean_name(st.session_state.project_name)
+        x,y,z=st.columns(3)
+        with x:
+            st.download_button('Scarica serie separate (ZIP)',exports['separate'],
+                file_name=prefix+'_serie_separate.zip',mime='application/zip',use_container_width=True)
+        with y:
+            st.download_button('Scarica risultati complessivi (ZIP)',exports['combined'],
+                file_name=prefix+'_risultati_completi.zip',mime='application/zip',use_container_width=True)
+        with z:
+            st.download_button('Scarica tutto (ZIP)',exports['all'],
+                file_name=prefix+'_TUTTO.zip',mime='application/zip',use_container_width=True,type='primary')
+        st.caption('Il pacchetto completo contiene CSV, XLSX e LaTeX separati per serie, gli equivalenti complessivi e il progetto JSON. Nessuna serie è duplicata.')
+    except Exception as e:
+        st.error(f'Impossibile creare l’archivio: {e}')
+else:
+    st.info('Aggiungi una serie al progetto per attivare gli archivi con file separati e complessivi. La serie corrente può essere scaricata dal riquadro sopra.')
 
 with st.expander('Informazioni sulle formule e sulle limitazioni'):
     st.write('Le specifiche derivano dalle tabelle dei manuali fornite per questa esperienza. Il programma non certifica condizioni operative non documentate.')
