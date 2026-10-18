@@ -8,6 +8,8 @@ from decimal import Decimal
 import pandas as pd
 import streamlit as st
 from engine import KINDS, UNITS, calculate, MeasurementError, DC_V, OHM, AC_V_RANGES, OSC_DIVS
+from importer import (METADATA, import_frame, normalize_phase, validate_rows,
+                      required_parameters, parameter_default, normalize_frame, ALIASES, name_key)
 
 st.set_page_config(page_title='Laboratorio | Incertezze', page_icon='🧪', layout='wide')
 st.title('Calcolatore di incertezze strumentali')
@@ -23,6 +25,8 @@ if 'active' not in st.session_state:
     st.session_state.active=INITIAL.copy()
 if 'delete_saved_series' not in st.session_state:
     st.session_state.delete_saved_series=None
+if 'editor_version' not in st.session_state:
+    st.session_state.editor_version=0
 if '_pending_project_name' in st.session_state:
     st.session_state.project_name=st.session_state.pop('_pending_project_name')
 if 'project_name' not in st.session_state:
@@ -51,35 +55,32 @@ def row_columns(config):
     return ['valore','unita']
 
 def dataframe_from_paste(raw, keys=None):
-    keys=keys or ['valore','portata','frequenza_Hz','V_div','offset_V','unita']
+    """Accetta una colonna oppure intestazioni e colonne da Excel (TAB)."""
+    keys=keys or ['valore']
     raw=raw.strip()
     if not raw: return pd.DataFrame(columns=keys)
     lines=[line for line in raw.splitlines() if line.strip()]
     parsed=[]
     for line in lines:
-        pieces=[s.strip() for s in (line.split('\t') if '\t' in line else line.split(';') if ';' in line else line.split())]
+        pieces=[v.strip() for v in (line.split('\t') if '\t' in line else line.split(';') if ';' in line else line.split())]
         parsed.append(pieces)
     width=max(map(len,parsed))
-    if width>len(keys): raise ValueError('Troppi campi: massimo 6 colonne')
-    # prima riga facoltativa con intestazioni: si riconoscono i nomi delle colonne
-    header=[x.lower().replace(' ','_') for x in parsed[0]]
-    known={'valore':'valore','value':'valore','misura':'valore','portata':'portata','range':'portata',
-           'frequenza':'frequenza_Hz','frequenza_hz':'frequenza_Hz','frequency':'frequenza_Hz',
-           'v/div':'V_div','v_div':'V_div','divisioni':'V_div','offset':'offset_V','offset_v':'offset_V',
-           'unità':'unita','unita':'unita','unit':'unita',
-           's_div':'s_div','s/div':'s_div','scala_orizzontale':'s_div',
-           'incertezza_f_hz':'incertezza_f_Hz','delta_f':'incertezza_f_Hz',
-           'incertezza_f':'incertezza_f_Hz'}
-    if header and all(h in known for h in header):
-        mapping=[known[h] for h in header]
+    header=[name_key(x) for x in parsed[0]]
+    if all(h in ALIASES for h in header):
+        mapping=[ALIASES[h] for h in header]
         parsed=parsed[1:]
-    else: mapping=keys[:width]
-    rows=[]
-    for pieces in parsed:
-        row=dict.fromkeys(keys,'')
-        for key,val in zip(mapping,pieces): row[key]=val
-        rows.append(row)
-    return pd.DataFrame(rows,columns=keys).fillna('')
+    else:
+        if width>len(keys):
+            raise ValueError('Più colonne del previsto: aggiungi intestazioni per identificare i campi.')
+        mapping=keys[:width]
+    if len(mapping)!=len(set(mapping)):
+        raise ValueError('Le intestazioni contengono colonne duplicate.')
+    data=[]
+    for items in parsed:
+        if len(items)>len(mapping):
+            raise ValueError('Una riga contiene più campi delle intestazioni.')
+        data.append(dict(zip(mapping,items)))
+    return pd.DataFrame(data,columns=mapping).fillna('')
 
 def range_with_unit(instrument, kind, raw_range):
     """Testo per esseri umani; il campo range_used rimane numerico nei CSV."""
@@ -98,7 +99,11 @@ def range_with_unit(instrument, kind, raw_range):
         return f"{format((value * 1000).normalize(), 'f')} mV"
     return f"{format(value.normalize(), 'f')} V"
 
-def calculate_series(config, rows):
+def calculate_series(config, rows, *, allow_defaults=False):
+    """Ricalcola SEMPRE da input per riga; non considera attendibili risultati JSON cached."""
+    errs=validate_rows(rows,config,allow_defaults=allow_defaults)
+    if errs:
+        return [],errs
     good=[]; errors=[]
     for i,row in enumerate(rows):
         val=str(row.get('valore','')).strip()
@@ -107,7 +112,9 @@ def calculate_series(config, rows):
             v=row.get(key,'')
             return default if v is None or str(v).strip() in ('','nan','None') else str(v).strip()
         try:
-            r=calculate(config['instrument'],config['kind'],val,opt('unita',config['unit']),
+            is_phase=(config['instrument']=='EDUX1052G' and config['kind']=='Fase letta (gradi)')
+            normalized=normalize_phase(val) if is_phase else val
+            r=calculate(config['instrument'],config['kind'],normalized,opt('unita',config['unit']),
                     range_used=opt('portata',config['default_range']),
                     frequency=opt('frequenza_Hz',config['frequency']),
                     v_div=opt('V_div',config['v_div']),offset=opt('offset_V',config['offset']),
@@ -118,11 +125,15 @@ def calculate_series(config, rows):
                     frequency_source=config.get('frequency_source','AFG-2225'),
                     frequency_years=config.get('frequency_years',0))
             d=r.__dict__.copy(); d['serie']=config['name']; d['riga']=i+1
-            # Conserviamo il range numerico per Python e una rappresentazione con unità
-            # per il controllo visivo e l'esportazione LaTeX.
             d['range_display']=range_with_unit(r.instrument,r.kind,r.range_used)
-            # Compiliamo i metadati solo quando pertinenti alla misura selezionata.
-            # Le altre celle CSV rimangono vuote (non contengono valori di default fittizi).
+            for metadata in METADATA:
+                v=row.get(metadata,'')
+                d[metadata]=str(v).strip() if v is not None else ''
+            if is_phase:
+                d['fase_originale_deg'] = (d['fase_originale_deg'] or val).replace(',','.')
+                d['fase_normalizzata_deg']=normalized
+            else:
+                d['fase_normalizzata_deg']=''
             if (config['instrument']=='34460A' and config['kind']=='Tensione AC') or (config['instrument']=='AFG-2225' and config['kind']=='Ampiezza Vpp'):
                 d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
             if config['instrument']=='EDUX1052G':
@@ -134,6 +145,8 @@ def calculate_series(config, rows):
                     d['s_div']=opt('s_div',config.get('s_div',''))
                     d['frequenza_Hz']=opt('frequenza_Hz',config['frequency'])
                     d['incertezza_f_Hz']=d['frequency_uncertainty_hz']
+                    if not d['frequenza_nominale_Hz']:
+                        d['frequenza_nominale_Hz']=d['frequenza_Hz']
             good.append(d)
         except (MeasurementError,ValueError) as e:
             errors.append(f"Riga {i+1}, valore {val}: {e}")
@@ -415,28 +428,47 @@ def unique_name(value, used, limit=None):
 
 
 def summary_by_row(series_dfs, labels):
-    """Affianca i dati per numero di riga, MA NON pretende di allinearli
-    automaticamente per frequenza: l'ordine delle tre serie va verificato.
-    """
-    widest = max((len(df) for df in series_dfs), default=0)
+    """Riepilogo per posizione, conservando frequenza nominale, letta e fase originale."""
+    widest=max((len(df) for df in series_dfs),default=0)
     rows=[]
+    meta=['foto','frequenza_nominale_Hz','frequenza_letta_osc_Hz',
+          'fonte_frequenza_nominale','fase_originale_deg','fase_normalizzata_deg']
     for i in range(widest):
-        row = {'riga': i+1, 'frequenza_Hz': ''}
+        row={'riga':i+1, 'frequenza_Hz':''}
+        for field in meta: row[field]=''
         for name,df in zip(labels,series_dfs):
-            if i >= len(df):
+            if i>=len(df):
                 for field in ('value_raw','uncertainty_raw','value_display','uncertainty_display','unit','range_display'):
                     row[f'{name}__{field}']=''
                 continue
             src=df.iloc[i]
             for field in ('value_raw','uncertainty_raw','value_display','uncertainty_display','unit','range_display'):
-                item=src.get(field, '')
+                item=src.get(field,'')
                 row[f'{name}__{field}']='' if pd.isna(item) else item
+            for field in meta:
+                value=src.get(field,'')
+                if pd.notna(value) and str(value).strip() and not str(row[field]).strip():
+                    row[field]=str(value)
             f=src.get('frequency_hz','')
             if pd.notna(f) and str(f).strip() and not str(row['frequenza_Hz']).strip():
                 row['frequenza_Hz']=str(f)
         rows.append(row)
     return pd.DataFrame(rows)
 
+
+def validate_series_alignment(series_dfs):
+    """Rifiuta un riepilogo apparentemente allineato ma con ID/frequenze diversi."""
+    errors=[]
+    for idx in range(max(map(len,series_dfs),default=0)):
+        for field in ('foto','frequenza_nominale_Hz','frequenza_letta_osc_Hz'):
+            vals=[]
+            for df in series_dfs:
+                if idx>=len(df): continue
+                v=df.iloc[idx].get(field,'')
+                if pd.notna(v) and str(v).strip(): vals.append(str(v).strip())
+            if len(set(vals))>1:
+                errors.append(f'Riga {idx+1}: {field} non coincide tra le serie: {vals}')
+    return errors
 
 def series_from_saved(saved):
     """Usa SOLO serie già aggiunte: la serie attiva non viene duplicata."""
@@ -470,6 +502,9 @@ def generate_project_exports(saved, project_name, project_json):
     for label,df in series:
         file_labels.append(unique_name(label,used_names))
         tables.append(df)
+    mismatches=validate_series_alignment(tables)
+    if mismatches:
+        raise ValueError('Serie non allineate: ' + ' | '.join(mismatches[:4]))
     all_df=pd.concat(tables,ignore_index=True,sort=False)
     # Il riepilogo per riga è utile quando tutte le serie hanno lo stesso ordine.
     # Non effettuiamo accoppiamenti automatici per frequenza in assenza di ID univoci.
@@ -562,10 +597,22 @@ with st.sidebar:
             obj=json.load(loaded)
             if obj.get('schema_version') != 1 or not isinstance(obj.get('series'),list):
                 raise ValueError('Formato del progetto incompatibile')
-            st.session_state.series=obj['series'];st.session_state.active=obj['active']
+            restored=[]
+            for saved in obj['series']:
+                cfg=saved['config']
+                if not cfg.get('rows'):
+                    raise ValueError(f'Serie {cfg.get("name", "?")}: mancano gli input originali, non posso verificare i risultati. Usa un JSON contenente le righe originali.')
+                computed,problems=calculate_series(cfg,cfg['rows'],allow_defaults=False)
+                if problems:
+                    raise ValueError(f'Serie {cfg.get("name", "?")}: ' + ' | '.join(problems[:3]))
+                if len(computed)!=len(saved.get('results',[])):
+                    raise ValueError('Numero di misure incoerente nel progetto salvato.')
+                restored.append({'config':cfg, 'results':computed})
+            st.session_state.series=restored;st.session_state.active=obj['active']
             st.session_state._pending_project_name=obj.get(
                 'project_name',st.session_state.active.get('name','Misure_esperienza'))
             st.session_state.delete_saved_series=None
+            st.session_state.editor_version+=1
             st.rerun()
         except (ValueError,KeyError,TypeError) as e: st.error(str(e))
     st.info('Il progetto va scaricato per conservarlo: il server gratuito non è un archivio permanente.')
@@ -651,16 +698,25 @@ if selected=='EDUX1052G' and c['kind'].startswith('Fase'):
                'lo skew tra canali e sonde non è coperto.')
 
 st.subheader('2. Inserisci i valori')
-st.write('Puoi incollare una colonna di Excel oppure più colonne separate da TAB. Nell’editor puoi cambiare **portata, frequenza, s/div, V/div, offset e unità singolarmente**. I campi vuoti usano i valori predefiniti.')
-columns=row_columns(c)
+st.write('Puoi incollare celle da Excel oppure caricare un CSV/XLSX. Le intestazioni permettono di associare i parametri alle righe. **Le colonne necessarie non vengono più ignorate silenziosamente.**')
+allow_defaults=st.checkbox('Autorizzo l’uso delle impostazioni predefinite quando mancano nelle singole righe',
+                           value=False, key='allow_per_row_defaults',
+                           help='Attiva soltanto se tutte le misure mancanti condividono davvero i valori predefiniti. Per le scansioni di frequenza tienila disattivata.')
+if c['instrument']=='EDUX1052G' and c['kind'].startswith('Fase'):
+    st.caption('Per importare fasi su più frequenze il file deve avere valore, frequenza_Hz e s_div. Le frequenze devono essere quelle usate nei calcoli, in Hz; s_div in secondi/divisione.')
+base_columns=row_columns(c)
+columns=base_columns+[k for k in METADATA if any(str(r.get(k,'')).strip() for r in c.get('rows',[]))]
 left,right=st.columns([2,1])
 with left:
     paste=st.text_area('Incolla celle copiate da Excel / Google Fogli',height=120,placeholder='0.5330\n0.9930\n1.4820',key='paste_values')
     if st.button('Aggiungi i valori incollati'):
         try:
-            add=dataframe_from_paste(paste,columns).to_dict('records')
+            pasted=dataframe_from_paste(paste,base_columns)
+            add=import_frame(pasted,c,allow_defaults=allow_defaults)
             c['rows']+=add
             st.success(f'Aggiunte {len(add)} righe.')
+            st.session_state.editor_version+=1
+            st.rerun()
         except Exception as e: st.error(f'Importazione: {e}')
 with right:
     upload=st.file_uploader('Oppure carica CSV / Excel',type=['csv','xlsx'])
@@ -670,21 +726,21 @@ with right:
                 dat=pd.read_excel(upload,dtype=str).fillna('')
             else:
                 dat=pd.read_csv(upload,dtype=str,sep=None,engine='python').fillna('')
-            keys=columns
-            if not 'valore' in dat.columns:
-                dat=dat.rename(columns={dat.columns[0]:'valore'})
-            c['rows']+=dat.reindex(columns=keys,fill_value='').to_dict('records')
-            st.success(f'Aggiunte {len(dat)} righe.')
+            new_rows=import_frame(dat,c,allow_defaults=allow_defaults)
+            c['rows']+=new_rows
+            st.success(f'Aggiunte {len(new_rows)} righe; frequenze e scale controllate.')
+            st.session_state.editor_version+=1
+            st.rerun()
         except Exception as e: st.error(f'File non leggibile: {e}')
 editor_df=pd.DataFrame(c['rows']).reindex(columns=columns,fill_value='').fillna('').astype(str)
-edited=st.data_editor(editor_df,num_rows='dynamic',hide_index=False,use_container_width=True,key='editor',
+edited=st.data_editor(editor_df,num_rows='dynamic',hide_index=False,use_container_width=True,key=f'editor_{st.session_state.editor_version}',
                       column_config={key:st.column_config.TextColumn(key,help='Lasciare vuoto per usare impostazione predefinita') for key in columns})
 c['rows']=edited.fillna('').to_dict('records')
 if st.button('Svuota la tabella'):
-    c['rows']=[];st.rerun()
+    c['rows']=[];st.session_state.editor_version+=1;st.rerun()
 
 st.subheader('3. Calcola e verifica')
-results,errors=calculate_series(c,c['rows'])
+results,errors=calculate_series(c,c['rows'],allow_defaults=allow_defaults)
 if errors:
     st.error('Alcune righe non possono essere calcolate:')
     for e in errors: st.write('• '+e)
@@ -723,7 +779,7 @@ if st.session_state.series:
         if len(set(exports['lengths']))>1:
             st.warning('Le serie hanno numeri di righe diversi: il foglio Riepilogo le affianca per posizione, non per frequenza. Controlla gli abbinamenti.')
         else:
-            st.info('Nel foglio Riepilogo le misure sono affiancate PER ORDINE DI RIGA. Controlla che le serie siano ordinate secondo le stesse frequenze.')
+            st.info('Nel foglio Riepilogo le misure sono affiancate per riga. Se sono presenti foto e frequenze nominali, il programma ne controlla la corrispondenza tra le serie.')
         prefix=clean_name(st.session_state.project_name)
         x,y,z=st.columns(3)
         with x:
